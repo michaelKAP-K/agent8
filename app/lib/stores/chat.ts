@@ -4,4 +4,7 @@ export const chatStore = map({
   started: false,
   aborted: false,
   showChat: true,
+  lastUserMessageBackup: '',
+  currentMessageId: '',
+  currentSnapshotId: '',
 });

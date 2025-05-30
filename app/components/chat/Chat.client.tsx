@@ -382,6 +382,9 @@ export const ChatImpl = memo(
         const usage = response.usage;
         setData(undefined);
 
+        // Save current message ID to store
+        chatStore.setKey('currentMessageId', message.id);
+
         if (usage) {
           logStore.logProvider('Chat response completed', {
             component: 'Chat',
@@ -396,6 +399,9 @@ export const ChatImpl = memo(
         workbenchStore.onArtifactClose(message.id, async () => {
           await runAndPreview(message);
           await handleCommit(message);
+
+          // Clear snapshots after successful completion
+          workbenchStore.clearFileSnapshots();
           workbenchStore.offArtifactClose(message.id);
         });
 
@@ -487,18 +493,68 @@ export const ChatImpl = memo(
       }
     };
 
-    const abort = () => {
-      stop();
-      setFakeLoading(false);
-      chatStore.setKey('aborted', true);
-      workbenchStore.abortAllActions();
+    const abort = async () => {
+      try {
+        // Stop AI response
+        stop();
+        setFakeLoading(false);
+        chatStore.setKey('aborted', true);
+        workbenchStore.abortAllActions();
 
-      logStore.logProvider('Chat response aborted', {
-        component: 'Chat',
-        action: 'abort',
-        model,
-        provider: provider.name,
-      });
+        // Clear current message ID if exists
+        const currentMessageId = chatStore.get().currentMessageId;
+
+        if (currentMessageId) {
+          workbenchStore.offArtifactClose(currentMessageId);
+        }
+
+        // Clear streaming state and progress data
+        streamingState.set(false);
+        setData(undefined);
+
+        // Rollback files to snapshot state
+        const currentSnapshotId = chatStore.get().currentSnapshotId;
+
+        if (currentSnapshotId) {
+          const rollbackSuccess = await workbenchStore.rollbackToLastSnapshot(currentSnapshotId);
+
+          if (rollbackSuccess) {
+            // Restore user message to input box
+            const backupMessage = chatStore.get().lastUserMessageBackup;
+
+            if (backupMessage) {
+              setInput(backupMessage);
+              toast.success('AI response stopped, message restored to input box for re-editing');
+            }
+
+            // Remove last AI message
+            setMessages((prev: Message[]) => {
+              const filteredMessages = prev.filter((msg) => msg.id !== currentMessageId);
+              return filteredMessages;
+            });
+          } else {
+            toast.error('File rollback failed');
+          }
+
+          // Clear snapshots
+          workbenchStore.clearFileSnapshots();
+        }
+
+        // Reset chat state
+        chatStore.setKey('currentMessageId', '');
+        chatStore.setKey('currentSnapshotId', '');
+        chatStore.setKey('lastUserMessageBackup', '');
+
+        logStore.logProvider('Chat response aborted', {
+          component: 'Chat',
+          action: 'abort',
+          model,
+          provider: provider.name,
+        });
+      } catch (error) {
+        logger.error('Error aborting:', error);
+        toast.error('Error occurred while stopping response');
+      }
     };
 
     useEffect(() => {
@@ -723,6 +779,14 @@ export const ChatImpl = memo(
         }
 
         chatStore.setKey('aborted', false);
+
+        // Create file snapshot before any modifications to save original state
+        const snapshotId = `snapshot_${Date.now()}`;
+        workbenchStore.createFileSnapshot(snapshotId);
+
+        // Backup user message and set snapshot ID
+        chatStore.setKey('lastUserMessageBackup', messageContent);
+        chatStore.setKey('currentSnapshotId', snapshotId);
 
         if (repoStore.get().path) {
           if (enabledTaskMode && repoStore.get().taskBranch === DEFAULT_TASK_BRANCH) {

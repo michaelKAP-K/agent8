@@ -46,6 +46,7 @@ export class WorkbenchStore {
   #editorStore = new EditorStore(this.#filesStore);
   #terminalStore = new TerminalStore(container);
   #artifactCloseCallbacks: Map<string, Array<() => void>> = new Map();
+  #fileSnapshots: Map<string, any> = new Map();
 
   artifacts: Artifacts = import.meta.hot?.data.artifacts ?? map({});
 
@@ -255,7 +256,24 @@ export class WorkbenchStore {
   }
 
   abortAllActions() {
-    // TODO: what do we wanna do and how do we wanna recover from this?
+    // Abort all running actions in artifacts
+    const artifacts = this.artifacts.get();
+
+    for (const artifact of Object.values(artifacts)) {
+      if (artifact.runner && artifact.runner.isRunning()) {
+        const actions = artifact.runner.actions.get();
+
+        // Abort all pending and running actions
+        for (const action of Object.values(actions)) {
+          if (action.status === 'pending' || action.status === 'running') {
+            action.abort();
+          }
+        }
+      }
+    }
+
+    // Clear action alert
+    this.actionAlert.set(undefined);
   }
 
   addArtifact({ messageId, title, id, type }: ArtifactCallbackData) {
@@ -715,6 +733,116 @@ export class WorkbenchStore {
 
       // Communication failure doesn't affect deployment success
     }
+  }
+
+  createFileSnapshot(snapshotId: string) {
+    try {
+      const currentFiles = this.files.get();
+      const currentDocuments = this.#editorStore.documents.get();
+
+      // Create clean documents copy using file system original content
+      const cleanDocuments: Record<string, any> = {};
+
+      for (const [filePath, document] of Object.entries(currentDocuments)) {
+        const fileContent = currentFiles[filePath];
+
+        if (fileContent && fileContent.type === 'file') {
+          // Use original content from file system instead of possibly unsaved editor content
+          cleanDocuments[filePath] = {
+            ...document,
+            value: fileContent.content,
+          };
+        } else {
+          cleanDocuments[filePath] = { ...document };
+        }
+      }
+
+      // Save snapshot with original file states to ensure clean restoration
+      const snapshot = {
+        files: JSON.parse(JSON.stringify(currentFiles)),
+        documents: cleanDocuments,
+        unsavedFiles: new Set(), // No unsaved files in snapshot state
+        timestamp: Date.now(),
+      };
+
+      this.#fileSnapshots.set(snapshotId, snapshot);
+
+      logger.debug(`Created file snapshot: ${snapshotId}, files count: ${Object.keys(currentFiles).length}`);
+    } catch (error) {
+      logger.error(`Failed to create snapshot ${snapshotId}:`, error);
+      throw error;
+    }
+  }
+
+  async rollbackToLastSnapshot(snapshotId: string) {
+    logger.debug(`Attempting to rollback to snapshot: ${snapshotId}`);
+
+    const snapshot = this.#fileSnapshots.get(snapshotId);
+
+    if (!snapshot) {
+      logger.warn(
+        `No snapshot found with id: ${snapshotId}, available snapshots:`,
+        Array.from(this.#fileSnapshots.keys()),
+      );
+      return false;
+    }
+
+    try {
+      logger.debug(`Rolling back files, count: ${Object.keys(snapshot.files).length}`);
+
+      // Update file system state
+      this.#filesStore.files.set(snapshot.files);
+      this.unsavedFiles.set(snapshot.unsavedFiles);
+
+      // Reset file modification state
+      this.resetAllFileModifications();
+      this.modifiedFiles.clear();
+
+      // For currently editing file, force reset content
+      const currentSelectedFile = this.selectedFile.get();
+
+      if (currentSelectedFile && snapshot.files[currentSelectedFile]) {
+        const snapshotFile = snapshot.files[currentSelectedFile];
+
+        if (snapshotFile?.type === 'file') {
+          // Override current document content (like reset button)
+          this.setCurrentDocumentContent(snapshotFile.content);
+
+          // Save immediately to ensure file system sync
+          await this.saveCurrentDocument();
+        }
+      }
+
+      /*
+       * Reinitialize all document states
+       * Clear EditorStore documents cache to prevent hot reload state revival
+       */
+      this.#editorStore.documents.set({});
+
+      // Force clear hot reload cache
+      if (import.meta.hot?.data.documents) {
+        import.meta.hot.data.documents = {};
+      }
+
+      this.setDocuments(snapshot.files);
+
+      // Ensure selected file remains unchanged
+      if (currentSelectedFile && snapshot.files[currentSelectedFile]) {
+        this.setSelectedFile(currentSelectedFile);
+      }
+
+      logger.debug(`Successfully rolled back to snapshot: ${snapshotId}`);
+
+      return true;
+    } catch (error) {
+      logger.error(`Failed to rollback to snapshot ${snapshotId}:`, error);
+      return false;
+    }
+  }
+
+  clearFileSnapshots() {
+    this.#fileSnapshots.clear();
+    logger.debug('Cleared all file snapshots');
   }
 }
 
